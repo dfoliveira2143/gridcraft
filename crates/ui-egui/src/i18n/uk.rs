@@ -662,7 +662,7 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "Contributors" => "Contributors",
         "Models" => "Models",
         "Version {version}" => "Version {version}",
-        "Join the ArtCraft Discord" => "Join the ArtCraft Discord",
+        "Project support" => "Project support",
         "This workbook has no scripts or macros." => "This workbook has no scripts or macros.",
         "(unnamed)" => "(unnamed)",
         "— VBA project (preserved, not run)" => "— VBA project (preserved, not run)",

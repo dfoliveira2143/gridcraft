@@ -48,3 +48,5 @@ Os guias são mapas de navegação, não novas cópias dos contratos técnicos. 
 - [Releasing GridCraft](releasing.md)
 - [UI parity](ui-parity.md)
 - [Importing Excel binary workbooks](xlsb-import.md)
+
+- [Creative Workshop: origem, identidade e publicação](branding.md)
