@@ -172,11 +172,13 @@ fn xlsb_scalar_caches_rk_unicode_visibility_and_epochs_survive_xlsx_save() {
         assert_eq!(wb.sheets[1].visibility, Visibility::Hidden);
         assert_eq!(wb.sheets[0].cells.len(), 14);
         assert_eq!(wb.sheets[0].merges, vec![RangeRef::new(CellRef::new(5, 0), CellRef::new(6, 1))]);
-        assert!(report.warnings.iter().any(|w| w.contains("will not recalculate") && w.contains("may display as numbers")));
+        assert!(report.warnings.iter().any(|w| w.contains("may display as numbers") && w.contains("XLSB saving is not supported")));
         for (col, expected) in expected.iter().enumerate() {
             assert_eq!(&wb.sheets[0].value(CellRef::new(2, col as u32)), expected);
         }
-        assert!(wb.sheets[0].cells.iter().all(|(_, c)| c.formula.is_none()));
+        for col in 10..=13 {
+            assert_eq!(wb.sheets[0].cell(CellRef::new(2, col)).and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), Some("1"));
+        }
         let (roundtrip, _) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
         assert_eq!(roundtrip.date_system, wb.date_system);
         for (col, expected) in expected.iter().enumerate() {
@@ -291,18 +293,37 @@ fn xlsb_requires_internal_typed_relationships_and_sniffs_only_root_workbook() {
 }
 
 #[test]
-fn xlsb_declared_counts_and_decoded_text_are_bounded() {
+fn xlsb_invalid_shared_string_counts_are_rejected() {
     let bad_sst = record(159, &[0xff; 8]);
     assert!(read_xlsb(&package(&book(false), &worksheet(&[], &[]), &bad_sst, ROOT, RELS, TYPES)).is_err());
     let mut count_mismatch = record(159, &[1, 0, 0, 0, 1, 0, 0, 0]);
     count_mismatch.extend(record(160, &[]));
     assert!(read_xlsb(&package(&book(false), &worksheet(&[], &[]), &count_mismatch, ROOT, RELS, TYPES)).is_err());
-    let mut data = row(0);
-    let text = wide(&"x".repeat(32767));
-    for col in 0..2050 {
-        data.extend(cell(6, col, &text));
-    }
-    assert!(read_xlsb(&file(&worksheet(&data, &[]))).unwrap_err().to_string().contains("64 MiB"));
+}
+
+#[test]
+fn xlsb_import_budget_preserves_shared_limits_and_the_browser_text_cap() {
+    let limits = crate::xlsb::import_limits();
+    assert_eq!(limits.binary_cells, 4_000_000);
+    assert_eq!(limits.binary_records, 40_000_000);
+    assert_eq!(limits.binary_text, if cfg!(target_arch = "wasm32") { 64 << 20 } else { 256 << 20 });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn xlsb_native_import_accepts_more_than_64_mib_of_decoded_text() {
+    // Three UTF-8 bytes per character cross the old cap with ~43 MiB of BIFF12 input.
+    let value = "界".repeat(32767);
+    let encoded = wide(&value);
+    let bytes = {
+        let mut data = row(0);
+        for col in 0..684 {
+            data.extend(cell(6, col, &encoded));
+        }
+        file(&worksheet(&data, &[]))
+    };
+    let (workbook, _) = read_xlsb(&bytes).unwrap();
+    assert_eq!(workbook.sheets[0].value(CellRef::new(0, 683)), text(&value));
 }
 
 #[test]
@@ -323,4 +344,186 @@ fn xlsb_phonetic_runs_use_documented_size_and_tolerate_padding() {
         assert_eq!(wb.sheets[0].value(CellRef::new(0, 0)), text("ruby"));
     }
     assert!(read_xlsb(&file(&worksheet(&[row(0), cell(62, 0, &phonetic(2, 12))].concat(), &[]))).is_err());
+}
+
+#[test]
+fn xlsb_formulas_defined_names_and_external_links_delegate_to_craft_xlsx() {
+    let mut wb_records = record(131, &[]);
+    let mut props = 0u32.to_le_bytes().to_vec();
+    props.extend(0u32.to_le_bytes());
+    props.extend(wide(""));
+    wb_records.extend(record(153, &props));
+    wb_records.extend(record(143, &[]));
+    for (id, rel, name, state) in [(1u32, "one", "Data", 0u32), (2, "two", "Hidden", 1)] {
+        let mut data = state.to_le_bytes().to_vec();
+        data.extend(id.to_le_bytes());
+        data.extend(wide(rel));
+        data.extend(wide(name));
+        wb_records.extend(record(156, &data));
+    }
+    wb_records.extend(record(144, &[]));
+    // Supporting books: book 0 = BrtSupSelf (357), book 1 = BrtSupBookSrc (355).
+    wb_records.extend(record(357, &[]));
+    wb_records.extend(record(355, &[]));
+    // BrtExternSheet (362): 2 XTIs: ixti 0 -> (book=0, sheet=1..1), ixti 1 -> (book=1, sheet=0..0).
+    let mut xti = 2u32.to_le_bytes().to_vec();
+    for (bk, first, last) in [(0u32, 1i32, 1i32), (1, 0, 0)] {
+        xti.extend(bk.to_le_bytes());
+        xti.extend(first.to_le_bytes());
+        xti.extend(last.to_le_bytes());
+    }
+    wb_records.extend(record(362, &xti));
+    // BrtName (39): "Rate" = Hidden!$A$1 (PtgRef3d ixti=0, r=0, c=0).
+    let mut ptg_ref3d_hidden = vec![0x3A, 0, 0];
+    ptg_ref3d_hidden.extend(0u32.to_le_bytes());
+    ptg_ref3d_hidden.extend(0u16.to_le_bytes());
+    let mut brt_name = 0u32.to_le_bytes().to_vec();
+    brt_name.push(0);
+    brt_name.extend(u32::MAX.to_le_bytes());
+    brt_name.extend(wide("Rate"));
+    brt_name.extend((ptg_ref3d_hidden.len() as u32).to_le_bytes());
+    brt_name.extend(&ptg_ref3d_hidden);
+    brt_name.extend(0u32.to_le_bytes());
+    brt_name.extend(u32::MAX.to_le_bytes()); // null comment
+    wb_records.extend(record(39, &brt_name));
+    wb_records.extend(record(132, &[]));
+
+    let fmla_num = |col: u32, cached: f64, rgce: &[u8]| {
+        let mut data = col.to_le_bytes().to_vec();
+        data.extend([0; 4]);
+        data.extend(cached.to_le_bytes());
+        data.extend([0; 2]);
+        data.extend((rgce.len() as u32).to_le_bytes());
+        data.extend(rgce);
+        data.extend(0u32.to_le_bytes());
+        record(9, &data)
+    };
+    let ptg_name = [0x23, 1, 0, 0, 0];
+    let ptg_ext = {
+        let mut v = vec![0x3A, 1, 0];
+        v.extend(0u32.to_le_bytes());
+        v.extend(0u16.to_le_bytes());
+        v
+    };
+    let mut data = row(0);
+    data.extend(fmla_num(0, 42.0, &ptg_ref3d_hidden));
+    data.extend(fmla_num(1, 7.0, &ptg_name));
+    data.extend(fmla_num(2, 99.0, &ptg_ext));
+
+    let bytes = package(&wb_records, &worksheet(&data, &[]), &sst(), ROOT, RELS, TYPES);
+    let (wb, report) = read_xlsb(&bytes).unwrap();
+    assert_eq!(wb.names.len(), 1);
+    assert_eq!((wb.names[0].name.as_str(), wb.names[0].formula.as_str(), wb.names[0].scope), ("Rate", "Hidden!$A$1", None));
+    assert_eq!(wb.sheets[0].cell(CellRef::new(0, 0)).and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), Some("Hidden!$A$1"));
+    assert_eq!(wb.sheets[0].cell(CellRef::new(0, 1)).and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), Some("Rate"));
+    assert!(wb.sheets[0].cell(CellRef::new(0, 2)).is_some_and(|c| c.formula.is_none() && c.value == Value::Number(99.0)));
+    assert!(report.warnings.iter().any(|w| w.contains("external link")), "{:?}", report.warnings);
+
+    let (rt, _) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    assert_eq!(rt.names.len(), 1);
+    assert_eq!(rt.sheets[0].cell(CellRef::new(0, 0)).and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), Some("Hidden!$A$1"));
+    assert_eq!(rt.sheets[0].cell(CellRef::new(0, 1)).and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), Some("Rate"));
+    assert_eq!(rt.sheets[0].value(CellRef::new(0, 2)), Value::Number(99.0));
+}
+
+#[test]
+fn xlsb_external_book_formulas_and_names_decode_and_roundtrip_through_xlsx() {
+    let mut wb_records = record(131, &[]);
+    let mut props = 0u32.to_le_bytes().to_vec();
+    props.extend(0u32.to_le_bytes());
+    props.extend(wide(""));
+    wb_records.extend(record(153, &props));
+    wb_records.extend(record(143, &[]));
+    for (id, rel, name, state) in [(1u32, "one", "Data", 0u32), (2, "two", "Hidden", 1)] {
+        let mut data = state.to_le_bytes().to_vec();
+        data.extend(id.to_le_bytes());
+        data.extend(wide(rel));
+        data.extend(wide(name));
+        wb_records.extend(record(156, &data));
+    }
+    wb_records.extend(record(144, &[]));
+    // Supporting books: book 0 = BrtSupSelf (357), book 1 = BrtSupBookSrc (355, rel "ext1").
+    wb_records.extend(record(357, &[]));
+    wb_records.extend(record(355, &wide("ext1")));
+    // BrtExternSheet (362): ixti 0 -> (book=1, sheet=0..0), ixti 1 -> (book=1, sheet=-2..-2).
+    let mut xti = 2u32.to_le_bytes().to_vec();
+    for (bk, first, last) in [(1u32, 0i32, 0i32), (1, -2, -2)] {
+        xti.extend(bk.to_le_bytes());
+        xti.extend(first.to_le_bytes());
+        xti.extend(last.to_le_bytes());
+    }
+    wb_records.extend(record(362, &xti));
+    wb_records.extend(record(132, &[]));
+
+    // External link part (links/externalLink1.bin): BrtBeginSupBook (360), BrtSupTabs (359),
+    // BrtSupNameStart/Bits/End (577/586/587), BrtEndSupBook (588).
+    let mut ext_bin = Vec::new();
+    let mut begin_sup = 0u16.to_le_bytes().to_vec();
+    begin_sup.extend(wide("rId1"));
+    begin_sup.extend(u32::MAX.to_le_bytes());
+    ext_bin.extend(record(360, &begin_sup));
+    let mut tabs = 2u32.to_le_bytes().to_vec();
+    tabs.extend(wide("Data"));
+    tabs.extend(wide("Other Sheet"));
+    ext_bin.extend(record(359, &tabs));
+    ext_bin.extend(record(577, &wide("ExtName")));
+    let mut bits = vec![0u8; 7];
+    bits[2..6].copy_from_slice(&0u32.to_le_bytes());
+    ext_bin.extend(record(586, &bits));
+    ext_bin.extend(record(587, &[]));
+    ext_bin.extend(record(588, &[]));
+
+    let fmla_num = |col: u32, cached: f64, rgce: &[u8]| {
+        let mut data = col.to_le_bytes().to_vec();
+        data.extend([0; 4]);
+        data.extend(cached.to_le_bytes());
+        data.extend([0; 2]);
+        data.extend((rgce.len() as u32).to_le_bytes());
+        data.extend(rgce);
+        data.extend(0u32.to_le_bytes());
+        record(9, &data)
+    };
+    let ptg_ext_ref = {
+        let mut v = vec![0x3A, 0, 0];
+        v.extend(0u32.to_le_bytes());
+        v.extend(0u16.to_le_bytes());
+        v
+    };
+    let ptg_ext_name = [0x39, 1, 0, 1, 0, 0, 0];
+    let mut data = row(0);
+    data.extend(fmla_num(0, 99.0, &ptg_ext_ref));
+    data.extend(fmla_num(1, 12.5, &ptg_ext_name));
+
+    let rels = RELS.replace(
+        "</Relationships>",
+        r#"<Relationship Id="ext1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLink" Target="../links/externalLink1.bin"/></Relationships>"#,
+    );
+    let types =
+        TYPES.replace("</Types>", r#"<Override PartName="/links/externalLink1.bin" ContentType="application/vnd.ms-excel.externalLink"/></Types>"#);
+    let link_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLinkPath" Target="Book2.xlsx" TargetMode="External"/></Relationships>"#;
+    let bytes = make_zip(&[
+        ("[Content_Types].xml", types.as_bytes()),
+        ("_rels/.rels", ROOT.as_bytes()),
+        ("records/book.bin", &wb_records),
+        ("records/_rels/book.bin.rels", rels.as_bytes()),
+        ("data/one.bin", &worksheet(&data, &[])),
+        ("data/two.bin", &worksheet(&[], &[])),
+        ("text/strings.bin", &sst()),
+        ("links/externalLink1.bin", &ext_bin),
+        ("links/_rels/externalLink1.bin.rels", link_rels.as_bytes()),
+    ]);
+
+    let (wb, _) = read_xlsb(&bytes).unwrap();
+    let c0 = wb.sheets[0].cell(CellRef::new(0, 0)).unwrap();
+    assert_eq!(c0.value, Value::Number(99.0));
+    assert_eq!(c0.formula.as_ref().map(|f| f.text.as_str()), Some("[1]Data!$A$1"));
+    let c1 = wb.sheets[0].cell(CellRef::new(0, 1)).unwrap();
+    assert_eq!(c1.value, Value::Number(12.5));
+    assert_eq!(c1.formula.as_ref().map(|f| f.text.as_str()), Some("[1]!ExtName"));
+
+    let (rt, _) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    assert_eq!(rt.sheets[0].cell(CellRef::new(0, 0)).and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), Some("[1]Data!$A$1"));
+    assert_eq!(rt.sheets[0].value(CellRef::new(0, 0)), Value::Number(99.0));
+    assert_eq!(rt.sheets[0].cell(CellRef::new(0, 1)).and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), Some("[1]!ExtName"));
+    assert_eq!(rt.sheets[0].value(CellRef::new(0, 1)), Value::Number(12.5));
 }
