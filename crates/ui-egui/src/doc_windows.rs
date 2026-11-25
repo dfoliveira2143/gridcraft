@@ -160,6 +160,15 @@ impl DocWindows {
             self.list.focus(id);
             self.viewports.focus(ctx, id);
         }
+        // macOS ignores Focus for a minimized window or a hidden app, so restore and show first.
+        if std::mem::take(&mut app.bring_forward)
+            && let Some(id) = self.list.active()
+        {
+            let vp = self.viewports.viewport_id(id);
+            ctx.send_viewport_cmd_to(vp, egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd_to(vp, egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd_to(vp, egui::ViewportCommand::Focus);
+        }
     }
 
     /// Draws every window. Call from the root viewport's UI each frame, in place of
@@ -248,7 +257,9 @@ fn visible_windows(app: &SheetApp) -> Vec<u64> {
 fn window_title(app: &SheetApp, window: u64) -> String {
     let title = app.session.window_title(window).unwrap_or_default();
     let dirty = app.session.window(window).and_then(|w| app.session.documents().iter().find(|d| d.uid == w.doc_uid)).is_some_and(|d| d.is_dirty());
-    if dirty { format!("{title} — Edited") } else { title }
+    let title = if dirty { format!("{title} — Edited") } else { title };
+    // Nightly says which channel the window belongs to; stable titles are unchanged.
+    crate::channel::window_title(&title)
 }
 
 /// Outer rectangles for `n` windows arranged within `bounds` as View › Arrange All's `arrange`

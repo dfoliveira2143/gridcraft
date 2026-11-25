@@ -114,6 +114,8 @@ pub struct Backstage {
     pub page: Page,
     /// Info: property drafts while a field is being edited (committed when it loses focus).
     props: [String; 6],
+    /// Focus at the end of the previous frame, before egui clears it on Esc.
+    text_edit_focused: bool,
     /// Print: the whole workbook rather than the active sheet.
     pub print_all: bool,
     /// Print: fit each sheet on one page.
@@ -138,6 +140,7 @@ impl Backstage {
         Backstage {
             page,
             props: Default::default(),
+            text_edit_focused: false,
             print_all: false,
             fit_to_page: false,
             preview_page: 0,
@@ -160,7 +163,7 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
     let Some(mut bs) = app.backstage.take() else { return };
     let ctx = ui.ctx().clone();
     // Esc inside a text field leaves the field; it closes the view only from outside one.
-    let typing = ctx.text_edit_focused();
+    let typing = bs.text_edit_focused;
     let t = Tokens::get(&ctx);
     let lang = app.ui.language;
     let mut out = Outcome::default();
@@ -229,6 +232,7 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
             });
         });
     });
+    bs.text_edit_focused = ctx.text_edit_focused();
     if !typing
         && app.dialog.is_none()
         && app.message.is_none()
@@ -794,11 +798,11 @@ fn account(app: &mut SheetApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let lang = app.ui.language;
     section(ui, lang, "Product Information");
-    ui.label(RichText::new("GridCraft").font(theme::ui_bold(16.0)).color(t.text));
+    ui.label(RichText::new(crate::channel::name()).font(theme::ui_bold(16.0)).color(t.text));
     ui.add_space(8.0);
     egui::Grid::new("backstage_account").num_columns(2).spacing(vec2(18.0, 8.0)).show(ui, |ui| {
         for (label, value) in
-            [("Version", env!("CARGO_PKG_VERSION").to_string()), ("Platform", platform()), ("Licence", env!("CARGO_PKG_LICENSE").to_string())]
+            [("Version", crate::channel::version().to_string()), ("Platform", platform()), ("Licence", env!("CARGO_PKG_LICENSE").to_string())]
         {
             ui.label(RichText::new(lang.tr(label)).color(t.text_dim));
             ui.label(value);
